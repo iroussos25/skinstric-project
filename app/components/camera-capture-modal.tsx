@@ -187,8 +187,8 @@ export default function CameraCaptureModal({
       isMirrored: boolean
     ) => {
       const ovalCenterX = canvasWidth / 2;
-      // Oval is positioned at 40% from top, not center
-      const ovalCenterY = canvasHeight * 0.4;
+      // Oval is positioned at 42% from top, not center
+      const ovalCenterY = canvasHeight * 0.42;
       // Match the visual oval proportions relative to video
       // The oval takes roughly 50% of width and 70% of height visually
       const ovalRadiusX = canvasWidth * 0.25;
@@ -566,7 +566,7 @@ export default function CameraCaptureModal({
   // Camera capture screen (full screen)
   return (
     <div 
-      className="absolute inset-0 z-50 bg-black"
+      className="fixed inset-0 z-50 bg-black"
       onClick={() => showTimerOptions && setShowTimerOptions(false)}
     >
       {/* Video background */}
@@ -614,7 +614,7 @@ export default function CameraCaptureModal({
       </button>
 
       {/* Oval face guide - positioned slightly above center for natural face framing */}
-      <div className="absolute left-1/2 top-[40%] -translate-x-1/2 -translate-y-1/2">
+      <div className="absolute left-1/2 top-[42%] -translate-x-1/2 -translate-y-1/2">
         <div
           className="relative h-120 w-89 rounded-[50%] sm:h-93.75 sm:w-69.5 md:h-140 md:w-104"
           style={{
@@ -805,7 +805,7 @@ export default function CameraCaptureModal({
       </div>
 
       {/* Instructions - Bottom */}
-      <div className="absolute bottom-8 left-1/2 -translate-x-1/2 text-center">
+      <div className="absolute bottom-12 left-1/2 -translate-x-1/2 text-center sm:bottom-8">
         <p className="text-sm text-white/80">
           For best results, make sure you have
         </p>
