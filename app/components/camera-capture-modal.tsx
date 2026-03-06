@@ -1,12 +1,15 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { FaceDetector, FilesetResolver } from "@mediapipe/tasks-vision";
 
 type CameraCaptureModalProps = {
   isOpen: boolean;
   onClose: () => void;
   onCapture: (base64Image: string) => Promise<void>;
 };
+
+const OVAL_SEGMENT_COUNT = 36;
 
 export default function CameraCaptureModal({
   isOpen,
@@ -24,7 +27,15 @@ export default function CameraCaptureModal({
   const [timerSetting, setTimerSetting] = useState<"OFF" | "3s" | "10s">("OFF");
   const [countdown, setCountdown] = useState<number | null>(null);
   const [isFaceDetected, setIsFaceDetected] = useState(false);
+  const [isPerfectlyPlaced, setIsPerfectlyPlaced] = useState(false);
+  const [segmentConfidences, setSegmentConfidences] = useState<number[]>(() =>
+    Array(OVAL_SEGMENT_COUNT).fill(0)
+  );
   const [showTimerOptions, setShowTimerOptions] = useState(false);
+  const [faceDetectorReady, setFaceDetectorReady] = useState(false);
+  const [faceDetectorLoading, setFaceDetectorLoading] = useState(true);
+  const faceDetectorRef = useRef<FaceDetector | null>(null);
+  const segmentConfidenceRef = useRef<number[]>(Array(OVAL_SEGMENT_COUNT).fill(0));
 
   useEffect(() => {
     if (!isOpen) {
@@ -35,6 +46,10 @@ export default function CameraCaptureModal({
       }
       setCapturedImage(null);
       setError(null);
+      setIsFaceDetected(false);
+      setIsPerfectlyPlaced(false);
+      setSegmentConfidences(Array(OVAL_SEGMENT_COUNT).fill(0));
+      segmentConfidenceRef.current = Array(OVAL_SEGMENT_COUNT).fill(0);
       return;
     }
 
@@ -113,86 +128,260 @@ export default function CameraCaptureModal({
     };
   }, [stream]);
 
-  // Simple face detection based on video analysis
+  // Initialize MediaPipe FaceDetector
+  useEffect(() => {
+    let isMounted = true;
+    
+    const initFaceDetector = async () => {
+      setFaceDetectorLoading(true);
+      try {
+        // Load MediaPipe vision WASM files from CDN
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+        );
+        
+        // Create face detector with video mode for real-time detection
+        const detector = await FaceDetector.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite",
+            delegate: "GPU"
+          },
+          runningMode: "VIDEO",
+          minDetectionConfidence: 0.5
+        });
+        
+        if (isMounted) {
+          faceDetectorRef.current = detector;
+          setFaceDetectorReady(true);
+          setFaceDetectorLoading(false);
+          console.log("MediaPipe FaceDetector initialized successfully");
+        }
+      } catch (err) {
+        console.error("MediaPipe FaceDetector initialization failed:", err);
+        if (isMounted) {
+          faceDetectorRef.current = null;
+          setFaceDetectorReady(false);
+          setFaceDetectorLoading(false);
+        }
+      }
+    };
+
+    initFaceDetector();
+    
+    return () => {
+      isMounted = false;
+      // Cleanup detector on unmount
+      if (faceDetectorRef.current) {
+        faceDetectorRef.current.close();
+        faceDetectorRef.current = null;
+      }
+    };
+  }, []);
+
+  // Calculate which segments of the oval are overlapped by the face
+  const calculateSegmentOverlap = useCallback(
+    (
+      faceBounds: { x: number; y: number; width: number; height: number },
+      canvasWidth: number,
+      canvasHeight: number,
+      isMirrored: boolean
+    ) => {
+      const ovalCenterX = canvasWidth / 2;
+      // Oval is positioned at 40% from top, not center
+      const ovalCenterY = canvasHeight * 0.4;
+      // Match the visual oval proportions relative to video
+      // The oval takes roughly 50% of width and 70% of height visually
+      const ovalRadiusX = canvasWidth * 0.25;
+      const ovalRadiusY = canvasHeight * 0.35;
+
+      // Mirror face bounds if camera is mirrored (front-facing)
+      const adjustedFaceBounds = isMirrored
+        ? {
+            x: canvasWidth - faceBounds.x - faceBounds.width,
+            y: faceBounds.y,
+            width: faceBounds.width,
+            height: faceBounds.height,
+          }
+        : faceBounds;
+
+      const faceCenterX = adjustedFaceBounds.x + adjustedFaceBounds.width / 2;
+      const faceCenterY = adjustedFaceBounds.y + adjustedFaceBounds.height / 2;
+      const faceRadiusX = adjustedFaceBounds.width / 2;
+      const faceRadiusY = adjustedFaceBounds.height / 2;
+
+      const segmentAngle = (Math.PI * 2) / OVAL_SEGMENT_COUNT;
+      const newSegmentValues: number[] = [];
+
+      // Calculate how well the face is centered in the oval
+      const centerOffsetX = Math.abs(faceCenterX - ovalCenterX) / ovalRadiusX;
+      const centerOffsetY = Math.abs(faceCenterY - ovalCenterY) / ovalRadiusY;
+      const centeringScore = Math.max(0, 1 - Math.sqrt(centerOffsetX * centerOffsetX + centerOffsetY * centerOffsetY));
+
+      for (let i = 0; i < OVAL_SEGMENT_COUNT; i++) {
+        // Start from top (-PI/2) and go clockwise
+        const angle = -Math.PI / 2 + i * segmentAngle;
+        
+        // Point on oval perimeter
+        const ovalPointX = ovalCenterX + Math.cos(angle) * ovalRadiusX;
+        const ovalPointY = ovalCenterY + Math.sin(angle) * ovalRadiusY;
+        
+        // Corresponding point on face perimeter (scaled from face center)
+        const facePointX = faceCenterX + Math.cos(angle) * faceRadiusX;
+        const facePointY = faceCenterY + Math.sin(angle) * faceRadiusY;
+        
+        // Distance from face edge to oval edge at this angle
+        const dx = ovalPointX - facePointX;
+        const dy = ovalPointY - facePointY;
+        const distToOval = Math.sqrt(dx * dx + dy * dy);
+        
+        // Normalize by oval size - smaller distance = better overlap
+        const normalizedDist = distToOval / Math.max(ovalRadiusX, ovalRadiusY);
+        
+        // Segment lights up when face edge is close to or past oval edge
+        // Also factor in centering for smoother feedback
+        let confidence = 0;
+        if (normalizedDist < 0.5) {
+          // Face edge is very close to or past this segment
+          confidence = 1.0;
+        } else if (normalizedDist < 1.0) {
+          // Face edge is approaching this segment
+          confidence = 1.0 - (normalizedDist - 0.5) * 2;
+        }
+        
+        // Boost confidence when face is well-centered
+        confidence = confidence * (0.5 + centeringScore * 0.5);
+        
+        newSegmentValues.push(Math.min(1, confidence));
+      }
+
+      return newSegmentValues;
+    },
+    []
+  );
+
+  // Face detection using FaceDetector API ONLY (no fallback to avoid false positives)
   useEffect(() => {
     if (!stream || !videoRef.current || !detectionCanvasRef.current) return;
 
     let animationFrameId: number;
+    let isDetecting = false;
     const video = videoRef.current;
     const canvas = detectionCanvasRef.current;
     const context = canvas.getContext("2d", { willReadFrequently: true });
+    const isMirrored = facingMode === "user";
 
     if (!context) return;
 
+    let lastDetectionTime = 0;
+    
     const detectFace = () => {
-      if (video.readyState === video.HAVE_ENOUGH_DATA) {
-        // Set canvas size to match video (smaller for performance)
-        canvas.width = 320;
-        canvas.height = 240;
-
-        // Draw current video frame to canvas
-        context.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-        // Define oval region matching the UI (450x600 aspect ratio, scaled down)
-        const centerX = canvas.width / 2;
-        const centerY = canvas.height / 2;
-        const ovalWidth = 100; // Smaller, more precise detection area
-        const ovalHeight = 140;
-
-        // Sample multiple points within the oval to check for centered face
-        const samplePoints = [
-          { x: centerX, y: centerY - ovalHeight * 0.25 }, // Upper face
-          { x: centerX, y: centerY }, // Center face
-          { x: centerX, y: centerY + ovalHeight * 0.15 }, // Lower face
-          { x: centerX - ovalWidth * 0.2, y: centerY - ovalHeight * 0.1 }, // Left cheek
-          { x: centerX + ovalWidth * 0.2, y: centerY - ovalHeight * 0.1 }, // Right cheek
-        ];
-
-        let skinTonePoints = 0;
-        const sampleRadius = 15; // Check area around each point
-
-        for (const point of samplePoints) {
-          const imageData = context.getImageData(
-            Math.max(0, point.x - sampleRadius),
-            Math.max(0, point.y - sampleRadius),
-            sampleRadius * 2,
-            sampleRadius * 2
-          );
-
-          let skinPixelsInSample = 0;
-          let totalPixelsInSample = 0;
-
-          for (let i = 0; i < imageData.data.length; i += 4) {
-            const r = imageData.data[i];
-            const g = imageData.data[i + 1];
-            const b = imageData.data[i + 2];
-
-            totalPixelsInSample++;
-
-            // Skin tone detection
-            if (
-              r > 95 &&
-              g > 40 &&
-              b > 20 &&
-              r > g &&
-              r > b &&
-              Math.abs(r - g) > 15
-            ) {
-              skinPixelsInSample++;
-            }
-          }
-
-          // If this sample point has significant skin tone (>30%), count it
-          if (skinPixelsInSample / totalPixelsInSample > 0.3) {
-            skinTonePoints++;
-          }
-        }
-
-        // Face is detected only if at least 4 out of 5 sample points detect skin
-        // This ensures the face is actually centered in the oval
-        setIsFaceDetected(skinTonePoints >= 4);
+      if (video.readyState !== video.HAVE_ENOUGH_DATA || isDetecting) {
+        animationFrameId = requestAnimationFrame(detectFace);
+        return;
       }
 
+      isDetecting = true;
+      
+      // Get current timestamp for video mode detection
+      const nowMs = performance.now();
+      
+      // Throttle detection to ~30fps for performance
+      if (nowMs - lastDetectionTime < 33) {
+        isDetecting = false;
+        animationFrameId = requestAnimationFrame(detectFace);
+        return;
+      }
+      lastDetectionTime = nowMs;
+
+      let faceBounds: { x: number; y: number; width: number; height: number } | null = null;
+
+      // Use MediaPipe FaceDetector
+      if (faceDetectorRef.current) {
+        try {
+          const result = faceDetectorRef.current.detectForVideo(video, nowMs);
+          if (result.detections.length > 0) {
+            const detection = result.detections[0];
+            const bb = detection.boundingBox;
+            
+            if (bb) {
+              // Convert normalized coordinates to pixel values
+              const videoWidth = video.videoWidth;
+              const videoHeight = video.videoHeight;
+              
+              // Validate face size is reasonable (not too small/large)
+              const faceArea = bb.width * bb.height;
+              const videoArea = videoWidth * videoHeight;
+              const faceRatio = faceArea / videoArea;
+              
+              if (faceRatio > 0.03 && faceRatio < 0.5) {
+                faceBounds = { 
+                  x: bb.originX, 
+                  y: bb.originY, 
+                  width: bb.width, 
+                  height: bb.height 
+                };
+              }
+            }
+          }
+        } catch {
+          // FaceDetector failed - no face detected
+        }
+      }
+
+      // Calculate segment overlaps with smooth interpolation
+      const previousConfidence = segmentConfidenceRef.current;
+      let nextConfidence: number[];
+      const hasFaceThisFrame = faceBounds !== null;
+
+      if (faceBounds) {
+        const rawOverlap = calculateSegmentOverlap(faceBounds, video.videoWidth, video.videoHeight, isMirrored);
+
+        // Smooth temporal interpolation for fluid animation
+        nextConfidence = rawOverlap.map((value, index) => {
+          const prev = previousConfidence[index] ?? 0;
+          const target = Math.min(1, value);
+          // Smooth transition rate
+          const rate = target > prev ? 0.4 : 0.25;
+          return prev + (target - prev) * rate;
+        });
+
+        // Light spatial smoothing for coherent appearance
+        const smoothed = nextConfidence.map((_, index) => {
+          const prevIdx = (index - 1 + OVAL_SEGMENT_COUNT) % OVAL_SEGMENT_COUNT;
+          const nextIdx = (index + 1) % OVAL_SEGMENT_COUNT;
+          return (
+            nextConfidence[index] * 0.7 +
+            nextConfidence[prevIdx] * 0.15 +
+            nextConfidence[nextIdx] * 0.15
+          );
+        });
+        nextConfidence = smoothed;
+      } else {
+        // Fast fade-out when no face detected - drop to 0 quickly
+        nextConfidence = previousConfidence.map((prev) => prev * 0.7);
+        // Zero out very small values to ensure clean state
+        nextConfidence = nextConfidence.map((v) => (v < 0.05 ? 0 : v));
+      }
+
+      segmentConfidenceRef.current = nextConfidence;
+
+      // Always update state for smooth animation
+      setSegmentConfidences([...nextConfidence]);
+
+      // Calculate overlap metrics
+      const totalConf = nextConfidence.reduce((sum, c) => sum + c, 0);
+      const overlap = totalConf / OVAL_SEGMENT_COUNT;
+      const activeSegs = nextConfidence.filter((c) => c > 0.5).length;
+
+      // Face is detected only if we have active segments AND found a face this frame
+      const hasFace = hasFaceThisFrame && activeSegs >= 3;
+      setIsFaceDetected(hasFace);
+
+      // Perfect placement: must have face this frame + high overlap + most segments active
+      const isPerfect = hasFaceThisFrame && overlap > 0.75 && activeSegs >= OVAL_SEGMENT_COUNT * 0.8;
+      setIsPerfectlyPlaced(isPerfect);
+
+      isDetecting = false;
       animationFrameId = requestAnimationFrame(detectFace);
     };
 
@@ -203,7 +392,7 @@ export default function CameraCaptureModal({
         cancelAnimationFrame(animationFrameId);
       }
     };
-  }, [stream]);
+  }, [stream, facingMode, calculateSegmentOverlap]);
 
   // Safety cleanup: ensure stream is stopped if component unmounts
   useLayoutEffect(() => {
@@ -299,6 +488,26 @@ export default function CameraCaptureModal({
   if (!isOpen) {
     return null;
   }
+
+  const totalConfidence = segmentConfidences.reduce((sum, c) => sum + c, 0);
+  const overlapRatio = totalConfidence / OVAL_SEGMENT_COUNT;
+  const segmentSpan = 360 / OVAL_SEGMENT_COUNT;
+
+  // Generate smooth gradient - green where face overlaps, transparent elsewhere
+  const borderGradient = `conic-gradient(from -90deg, ${segmentConfidences
+    .map((confidence, index) => {
+      const start = index * segmentSpan;
+      const end = (index + 1) * segmentSpan;
+      // Only show green where confidence > threshold, with smooth falloff
+      const intensity = Math.max(0, (confidence - 0.15) / 0.85);
+      const opacity = Math.min(1, intensity * 1.2);
+      const color =
+        isPerfectlyPlaced
+          ? `rgba(74, 222, 128, ${opacity.toFixed(3)})` // Bright green when perfect
+          : `rgba(74, 222, 128, ${(opacity * 0.9).toFixed(3)})`;
+      return `${color} ${start}deg ${end}deg`;
+    })
+    .join(", ")})`;
 
   // Review screen (after capture)
   if (capturedImage) {
@@ -404,16 +613,38 @@ export default function CameraCaptureModal({
         </svg>
       </button>
 
-      {/* Oval face guide - Center */}
-      <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2">
+      {/* Oval face guide - positioned slightly above center for natural face framing */}
+      <div className="absolute left-1/2 top-[40%] -translate-x-1/2 -translate-y-1/2">
         <div
-          className={`h-80 w-60 sm:h-156.25 sm:w-118.75 md:h-187.5 md:w-[562.5px] rounded-[50%] border-4 transition-all duration-300 ${
-            isFaceDetected
-              ? "border-green-400 shadow-[0_0_30px_rgba(74,222,128,0.6)]"
-              : "border-white/40"
-          }`}
-          style={{ boxShadow: isFaceDetected ? "0 0 0 9999px rgba(0, 0, 0, 0.3), 0 0 30px rgba(74, 222, 128, 0.6)" : "0 0 0 9999px rgba(0, 0, 0, 0.3)" }}
+          className="relative h-120 w-89 rounded-[50%] sm:h-93.75 sm:w-69.5 md:h-140 md:w-104"
+          style={{
+            // Base white border
+            border: "4px solid rgba(255, 255, 255, 0.4)",
+            // Green glow intensifies with overlap, extra bright when perfect
+            boxShadow: isPerfectlyPlaced
+              ? "0 0 0 9999px rgba(0, 0, 0, 0.3), 0 0 50px rgba(74, 222, 128, 0.9), 0 0 80px rgba(74, 222, 128, 0.6)"
+              : overlapRatio > 0.1
+                ? `0 0 0 9999px rgba(0, 0, 0, 0.3), 0 0 ${15 + overlapRatio * 25}px rgba(74, 222, 128, ${Math.min(0.7, overlapRatio * 0.9)})`
+                : "0 0 0 9999px rgba(0, 0, 0, 0.3)",
+            transition: "box-shadow 0.2s ease-out",
+          }}
         >
+          {/* Green border overlay - colors only the segments where face overlaps */}
+          <div
+            className="pointer-events-none absolute rounded-[50%]"
+            style={{
+              // Position exactly on top of the border
+              top: "-4px",
+              left: "-4px",
+              right: "-4px",
+              bottom: "-4px",
+              background: borderGradient,
+              // Mask to show only the border ring (4px wide)
+              mask: "radial-gradient(farthest-side, transparent calc(100% - 4px), #000 calc(100% - 4px), #000 100%, transparent 100%)",
+              WebkitMask: "radial-gradient(farthest-side, transparent calc(100% - 4px), #000 calc(100% - 4px), #000 100%, transparent 100%)",
+              borderRadius: "50%",
+            }}
+          />
           {/* Countdown dial - Top of oval */}
           {countdown !== null && countdown > 0 && (
             <div className="absolute left-1/2 top-8 -translate-x-1/2">
@@ -471,11 +702,26 @@ export default function CameraCaptureModal({
               )}
             </div>
           )}
+
+          {/* Perfect placement message - shown below oval when face is perfectly centered */}
+          {isPerfectlyPlaced && countdown === null && (
+            <div className="absolute -bottom-16 left-1/2 -translate-x-1/2 whitespace-nowrap">
+              <p 
+                className="text-sm font-bold uppercase tracking-[0.25em] text-green-400"
+                style={{
+                  textShadow: "0 0 20px rgba(74, 222, 128, 0.8), 0 0 40px rgba(74, 222, 128, 0.5)",
+                  animation: "pulse 1.5s ease-in-out infinite",
+                }}
+              >
+                Perfect, Hold Still!
+              </p>
+            </div>
+          )}
         </div>
       </div>
 
       {/* Timer control - Left Side */}
-      <div className="absolute bottom-1/2 left-8 flex translate-y-1/2 flex-row items-center gap-2">
+      <div className="absolute bottom-1/4 left-4 flex translate-y-1/2 flex-row items-center gap-2 sm:bottom-1/2 sm:left-8">
         {/* Timer button */}
         <button
           type="button"
@@ -533,7 +779,7 @@ export default function CameraCaptureModal({
       </div>
 
       {/* Capture button - Right Side */}
-      <div className="absolute bottom-1/2 right-8 flex translate-y-1/2 flex-col items-center gap-2">
+      <div className="absolute bottom-1/4 right-4 flex translate-y-1/2 flex-col items-center gap-2 sm:bottom-1/2 sm:right-8">
         <button
           type="button"
           onClick={handleCapture}
@@ -577,6 +823,23 @@ export default function CameraCaptureModal({
         <div className="absolute left-1/2 top-20 -translate-x-1/2">
           <p className="rounded-lg bg-red-600 px-4 py-2 text-xs text-white">
             {error}
+          </p>
+        </div>
+      )}
+
+      {/* FaceDetector loading/not available warning */}
+      {faceDetectorLoading && stream && !error && (
+        <div className="absolute left-1/2 top-20 -translate-x-1/2 max-w-sm">
+          <p className="rounded-lg bg-blue-600 px-4 py-2 text-xs text-white text-center flex items-center gap-2">
+            <span className="inline-block w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin"></span>
+            Loading face detection...
+          </p>
+        </div>
+      )}
+      {!faceDetectorReady && !faceDetectorLoading && stream && !error && (
+        <div className="absolute left-1/2 top-20 -translate-x-1/2 max-w-sm">
+          <p className="rounded-lg bg-yellow-600 px-4 py-2 text-xs text-white text-center">
+            Face detection failed to load. Please refresh the page and try again.
           </p>
         </div>
       )}
