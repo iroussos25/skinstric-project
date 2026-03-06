@@ -705,9 +705,9 @@ export default function CameraCaptureModal({
 
           {/* Perfect placement message - shown below oval when face is perfectly centered */}
           {isPerfectlyPlaced && countdown === null && (
-            <div className="absolute -bottom-16 left-1/2 -translate-x-1/2 whitespace-nowrap">
+            <div className="absolute -bottom-10 left-1/2 -translate-x-1/2 whitespace-nowrap">
               <p 
-                className="text-sm font-bold uppercase tracking-[0.25em] text-green-400"
+                className="text-xs font-bold uppercase tracking-[0.25em] text-green-400 sm:text-sm"
                 style={{
                   textShadow: "0 0 20px rgba(74, 222, 128, 0.8), 0 0 40px rgba(74, 222, 128, 0.5)",
                   animation: "pulse 1.5s ease-in-out infinite",
@@ -805,7 +805,7 @@ export default function CameraCaptureModal({
       </div>
 
       {/* Instructions - Bottom */}
-      <div className="absolute bottom-12 left-1/2 -translate-x-1/2 text-center sm:bottom-8">
+      <div className="absolute bottom-16 left-1/2 -translate-x-1/2 text-center sm:bottom-4">
         <p className="text-sm text-white/80">
           For best results, make sure you have
         </p>
